@@ -22,16 +22,25 @@
                      купоны · дивиденды                                   состава/операций     лимиты, аллокация
 ```
 
-## Слои
+## Слои (`src/investor_mcp/`)
 
 ```
-server.py     тулы / ресурсы / промпты · транспорт (stdio | streamable-http) · авторизация
+server.py        тулы / ресурсы / промпты · транспорт (stdio | streamable-http) · авторизация
    │
-service.py    вся аналитика + кэш + персист (transport-agnostic «голова»)
+service/         transport-agnostic «голова» — InvestorService собирается из миксинов:
+   ├── core.py        dataclass + профиль/синк/счета/отчёты + сборка миксинов
+   ├── cache.py       кэш позиций/счетов/операций (TTL, fresh/cached/stale)
+   ├── portfolio.py   портфель, анализ, инструмент, симуляция, аллокация
+   ├── risk.py        риск-сигналы (позиция/эмитент/сектор)
+   ├── bonds.py       бонд-календарь (купоны/погашения/лестница)
+   ├── research.py    новостной бриф + контекст-линзы
+   ├── goals.py       прогресс к целям (капитал/доход/проекция)
+   └── recommend.py   рекомендации по пополнению
    │
-   ├── adapters.py   брокер: MockBrokerAdapter | TinkoffInvestAdapter (только чтение)
-   ├── storage.py    SQLite (профиль, выбранные счета, снимки, рекомендации, отчёты, кэш)
-   └── models.py     доменные модели (Money, Account, Instrument, Position, Operation, Profile)
+   ├── adapters/   брокер (только чтение): mock.py (Mock) | tinkoff.py (Tinkoff) + маппинг
+   ├── storage.py  SQLite (профиль, счета, снимки, рекомендации, отчёты, кэш)
+   ├── responses.py конверт ответа (ok_response/error_response) + ярлыки
+   └── models.py   доменные модели (Money, Account, Instrument, Position, Operation, Profile)
 ```
 
 Контракт MCP: **19 тулов, 11 ресурсов, 5 промптов**. Каждый тул возвращает конверт
