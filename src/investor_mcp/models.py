@@ -1,3 +1,5 @@
+"""Normalized domain models: Money, Account, Instrument, Position, Operation, profile."""
+
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field

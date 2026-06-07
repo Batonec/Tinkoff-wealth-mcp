@@ -1,10 +1,12 @@
+"""RiskMixin: concentration and risk-signal scanning over the current portfolio."""
+
 from __future__ import annotations
 
 from collections import defaultdict
 from typing import Any
 
-from .models import Position
-from .responses import ok_response
+from ..models import Position
+from ..responses import ok_response
 
 
 class RiskMixin:

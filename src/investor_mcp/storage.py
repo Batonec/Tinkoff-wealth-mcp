@@ -1,3 +1,5 @@
+"""SQLite persistence for settings, snapshots, recommendations, and reports."""
+
 from __future__ import annotations
 
 import json

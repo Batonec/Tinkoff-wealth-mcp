@@ -1,19 +1,21 @@
+"""InvestorService core: state, persistence wiring, and account/report/sync tools."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any
 
-from .adapters import BrokerAdapter, MockBrokerAdapter
-from .models import Account, InvestorProfile, Operation, Position, utc_now_iso
-from .responses import error_response, ok_response
-from .storage import Storage
-from ._cache import CacheMixin
-from ._portfolio import PortfolioMixin
-from ._risk import RiskMixin
-from ._bonds import BondMixin
-from ._research import ResearchMixin
-from ._goals import GoalsMixin
-from ._recommend import RecommendMixin
+from ..adapters import BrokerAdapter, MockBrokerAdapter
+from ..models import Account, InvestorProfile, Operation, Position, utc_now_iso
+from ..responses import error_response, ok_response
+from ..storage import Storage
+from .cache import CacheMixin
+from .portfolio import PortfolioMixin
+from .risk import RiskMixin
+from .bonds import BondMixin
+from .research import ResearchMixin
+from .goals import GoalsMixin
+from .recommend import RecommendMixin
 
 
 @dataclass

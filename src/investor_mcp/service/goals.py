@@ -1,9 +1,11 @@
+"""GoalsMixin: progress toward capital targets, passive-income coverage, and timeline."""
+
 from __future__ import annotations
 
 from typing import Any
 
-from .models import Money
-from .responses import ok_response
+from ..models import Money
+from ..responses import ok_response
 
 
 class GoalsMixin:

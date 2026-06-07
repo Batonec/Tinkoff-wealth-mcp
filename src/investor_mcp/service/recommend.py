@@ -1,9 +1,11 @@
+"""RecommendMixin: goal-aware next-action recommendations from available cash."""
+
 from __future__ import annotations
 
 from typing import Any
 
-from .models import Money
-from .responses import _asset_class_label, ok_response
+from ..models import Money
+from ..responses import _asset_class_label, ok_response
 
 
 class RecommendMixin:

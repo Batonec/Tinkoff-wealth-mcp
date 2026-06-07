@@ -1,3 +1,5 @@
+"""MCP server surface (FastMCP): registers the investor tools and resources."""
+
 from __future__ import annotations
 
 import argparse

@@ -1,3 +1,5 @@
+"""Response-envelope helpers (ok/error) and shared label maps for tool outputs."""
+
 from __future__ import annotations
 
 from typing import Any

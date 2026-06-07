@@ -1,10 +1,12 @@
+"""ResearchMixin: portfolio-derived news digest and per-instrument research briefs."""
+
 from __future__ import annotations
 
 from collections import defaultdict
 from typing import Any
 
-from .models import Money, Position, utc_now_iso
-from .responses import _NON_ISSUER, _sector_label, ok_response
+from ..models import Money, Position, utc_now_iso
+from ..responses import _NON_ISSUER, _sector_label, ok_response
 
 
 class ResearchMixin:
