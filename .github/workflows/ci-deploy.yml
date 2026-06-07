@@ -30,25 +30,34 @@ jobs:
     concurrency:
       group: deploy-vps
       cancel-in-progress: true
+    env:
+      VPS_HOST: ${{ secrets.VPS_HOST }}
+      VPS_USER: ${{ secrets.VPS_USER }}
+      VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
     steps:
       - uses: actions/checkout@v4
+      - name: Check required secrets
+        run: |
+          test -n "$VPS_HOST"    || { echo "::error::Secret VPS_HOST is empty (must be a Repository secret named VPS_HOST)"; exit 1; }
+          test -n "$VPS_USER"    || { echo "::error::Secret VPS_USER is empty"; exit 1; }
+          test -n "$VPS_SSH_KEY" || { echo "::error::Secret VPS_SSH_KEY is empty"; exit 1; }
+          echo "All deploy secrets are present."
       - name: Set up SSH
         run: |
           mkdir -p ~/.ssh
-          printf '%s\n' "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/deploy_key
+          printf '%s\n' "$VPS_SSH_KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
-          ssh-keyscan -H "${{ secrets.VPS_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null
+          ssh-keyscan -H "$VPS_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
       - name: Rsync code to VPS
         run: |
           rsync -az \
             --exclude='__pycache__' --exclude='*.egg-info' \
             -e "ssh -i ~/.ssh/deploy_key -o BatchMode=yes" \
             src pyproject.toml README.md \
-            "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}:/opt/investor-mcp/"
+            "$VPS_USER@$VPS_HOST:/opt/investor-mcp/"
       - name: Install deps & restart service
         run: |
-          ssh -i ~/.ssh/deploy_key -o BatchMode=yes \
-            "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}" \
+          ssh -i ~/.ssh/deploy_key -o BatchMode=yes "$VPS_USER@$VPS_HOST" \
             'cd /opt/investor-mcp && .venv/bin/pip install -q -e . && systemctl restart investor-mcp && sleep 2 && systemctl is-active investor-mcp'
       - name: Clean up key
         if: always()
