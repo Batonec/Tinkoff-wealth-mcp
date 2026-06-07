@@ -62,10 +62,13 @@ class _BearerAuthMiddleware:
 def _result(payload: dict[str, Any]) -> CallToolResult:
     """Wrap a service response dict into an MCP CallToolResult.
 
-    The human-readable text is the ``summary`` field; the full wrapper goes into
-    ``structuredContent``; ``isError`` is derived from ``ok``.
+    The full payload is serialized into the ``content`` text (so every MCP client,
+    incl. those that ignore ``structuredContent`` when no outputSchema is declared,
+    actually shows the model the data), AND mirrored into ``structuredContent`` for
+    clients that use it. ``isError`` is derived from ``ok``.
     """
-    text = payload.get("summary") or ("Ошибка." if not payload.get("ok", True) else "Готово.")
+    summary = payload.get("summary") or ("Ошибка." if not payload.get("ok", True) else "Готово.")
+    text = f"{summary}\n\n{_json(payload)}"
     return CallToolResult(
         content=[TextContent(type="text", text=text)],
         structuredContent=payload,
