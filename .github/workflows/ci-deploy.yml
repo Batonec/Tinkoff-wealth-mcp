@@ -1,0 +1,55 @@
+name: CI / Deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install package
+        run: python -m pip install -e .
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
+
+  deploy:
+    needs: test
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: deploy-vps
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "${{ secrets.VPS_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null
+      - name: Rsync code to VPS
+        run: |
+          rsync -az \
+            --exclude='__pycache__' --exclude='*.egg-info' \
+            -e "ssh -i ~/.ssh/deploy_key -o BatchMode=yes" \
+            src pyproject.toml README.md \
+            "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}:/opt/investor-mcp/"
+      - name: Install deps & restart service
+        run: |
+          ssh -i ~/.ssh/deploy_key -o BatchMode=yes \
+            "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}" \
+            'cd /opt/investor-mcp && .venv/bin/pip install -q -e . && systemctl restart investor-mcp && sleep 2 && systemctl is-active investor-mcp'
+      - name: Clean up key
+        if: always()
+        run: rm -f ~/.ssh/deploy_key

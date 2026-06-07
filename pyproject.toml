@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "investor-mcp"
+version = "0.1.0"
+description = "Personal investment assistant MCP server"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.0.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+# The official SDK (tinkoff.invest) is no longer on PyPI, and its own metadata
+# pins an unpublished `tinkoff` package — so it cannot be resolved normally.
+# This extra installs its REAL runtime deps; install the SDK itself separately:
+#   pip install --no-deps "git+https://github.com/RussianInvestments/invest-python.git"
+# (see README "Real Tinkoff data"). protobuf<5 is required by the generated stubs.
+tinkoff = [
+    "grpcio>=1.59.3,<2.0.0",
+    "protobuf>=4.25.1,<5.0.0",
+    "cachetools>=5.2.0,<6.0.0",
+    "python-dateutil>=2.8.2,<3.0.0",
+    "deprecation>=2.1.0,<3.0.0",
+]
+
+[project.scripts]
+investor-mcp = "investor_mcp.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

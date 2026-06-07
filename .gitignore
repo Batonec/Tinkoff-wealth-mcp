@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+*.env
+!.env.example
+data/
+build/
+dist/
+*.egg-info/
+
+# secrets / local artifacts (never commit)
+investor-streisand-*
+*.pem
+*.key
+*.p12
+
