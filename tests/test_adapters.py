@@ -267,6 +267,14 @@ class TinkoffAdapterTest(unittest.TestCase):
         self.assertEqual(operations[0].operation_type, "buy")
 
 
+class MockBondDataTest(unittest.TestCase):
+    def test_mock_get_bond_data(self) -> None:
+        data = MockBrokerAdapter().get_bond_data(["OFZ26243", "SBER"])
+        self.assertTrue(data["OFZ26243"]["coupons"])
+        self.assertEqual(data["OFZ26243"]["coupon_quantity_per_year"], 2)
+        self.assertEqual(data["SBER"]["coupons"], [])
+
+
 class BuildBrokerAdapterTest(unittest.TestCase):
     def setUp(self) -> None:
         self._saved = {k: os.environ.get(k) for k in ("TINKOFF_INVEST_TOKEN", "TINKOFF_INVEST_SANDBOX")}

@@ -308,6 +308,15 @@ def investor_generate_report(
 
 
 @mcp.tool()
+def investor_get_bond_calendar(
+    horizon_days: int = 90,
+    account_ids: list[str] | None = None,
+) -> CallToolResult:
+    """Bond calendar: upcoming coupons/maturities/offers, maturity ladder, 12m coupon income."""
+    return _result(service.get_bond_calendar(account_ids, horizon_days))
+
+
+@mcp.tool()
 def investor_research_instrument(
     instrument: dict[str, Any],
     depth: str = "standard",

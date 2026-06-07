@@ -43,6 +43,34 @@ class InvestorServiceTest(unittest.TestCase):
         self.assertGreaterEqual(len(recommendations), 1)
         self.assertIn("amount", recommendations[0])
 
+    def test_bond_calendar_lists_coupons_and_ladder(self) -> None:
+        service = InvestorService()
+
+        result = service.get_bond_calendar(horizon_days=90)
+
+        self.assertTrue(result["ok"])
+        data = result["data"]
+        self.assertEqual(len(data["bonds"]), 1)
+        self.assertTrue(any(e["type"] == "coupon" for e in data["upcoming_events"]))
+        self.assertGreater(data["projected_coupon_income_12m"]["amount"], 0)
+        self.assertTrue(any(bucket["bucket"] == "1-3y" for bucket in data["maturity_ladder"]))
+        self.assertIsNotNone(data["bonds"][0]["next_coupon"])
+
+    def test_bond_calendar_includes_maturity_in_long_horizon(self) -> None:
+        service = InvestorService()
+
+        result = service.get_bond_calendar(horizon_days=800)
+
+        self.assertTrue(any(e["type"] == "maturity" for e in result["data"]["upcoming_events"]))
+
+    def test_bond_calendar_empty_when_no_bonds(self) -> None:
+        service = InvestorService()
+
+        result = service.get_bond_calendar(account_ids=["mock-iis"])
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["data"]["bonds"], [])
+
     def test_scan_risks_includes_sector_concentration(self) -> None:
         service = InvestorService()
 

@@ -111,6 +111,34 @@ class MockBrokerAdapter:
         account_set = set(account_ids)
         return [operation for operation in self.operations if operation.account_id in account_set]
 
+    def get_bond_data(self, instrument_uids: list[str]) -> dict[str, dict]:
+        today = datetime.now(timezone.utc).date()
+        result: dict[str, dict] = {}
+        for uid in instrument_uids:
+            if uid == "OFZ26243":
+                result[uid] = {
+                    "maturity_date": (today + timedelta(days=730)).isoformat(),
+                    "offer_date": None,
+                    "nominal": 1000.0,
+                    "currency": "RUB",
+                    "coupon_quantity_per_year": 2,
+                    "amortization": False,
+                    "perpetual": False,
+                    "floating": False,
+                    "coupons": [
+                        {"date": (today + timedelta(days=30)).isoformat(), "amount_per_bond": 34.9},
+                        {"date": (today + timedelta(days=212)).isoformat(), "amount_per_bond": 34.9},
+                        {"date": (today + timedelta(days=394)).isoformat(), "amount_per_bond": 34.9},
+                    ],
+                }
+            else:
+                result[uid] = {
+                    "maturity_date": None, "offer_date": None, "nominal": 0.0, "currency": "RUB",
+                    "coupon_quantity_per_year": 0, "amortization": False, "perpetual": False,
+                    "floating": False, "coupons": [],
+                }
+        return result
+
 
 # Tinkoff instrument_type -> our asset_class.
 _ASSET_CLASS = {
@@ -132,6 +160,18 @@ def _money(value: Any) -> float:
     if value is None:
         return 0.0
     return float(getattr(value, "units", 0)) + float(getattr(value, "nano", 0)) / 1e9
+
+
+def _date(value: Any) -> str | None:
+    """Convert a Tinkoff datetime to an ISO date string; None for unset (epoch 1970)."""
+    if value is None:
+        return None
+    try:
+        if getattr(value, "year", 0) <= 1970:
+            return None
+        return value.date().isoformat() if hasattr(value, "date") else str(value)[:10]
+    except Exception:
+        return None
 
 
 def _currency_of(value: Any, fallback: str) -> str:
@@ -273,6 +313,7 @@ class TinkoffInvestAdapter:
         self._client_factory = client_factory
         self._instrument_cache: dict[str, Instrument] = {}
         self._brand_cache: dict[str, str | None] = {}
+        self._bond_cache: dict[str, dict[str, Any]] = {}
 
     def _open(self) -> Any:
         if self._client_factory is not None:
@@ -421,6 +462,54 @@ class TinkoffInvestAdapter:
                         break
                     cursor = response.next_cursor
             return operations
+
+    def get_bond_data(self, instrument_uids: list[str]) -> dict[str, dict[str, Any]]:
+        """Per-bond schedule for the bond calendar: maturity, offer, coupons (cached).
+
+        Coupons come from get_bond_coupons (pay_one_bond per coupon); maturity/offer
+        from the bond card. Amounts are per ONE bond; the service scales by quantity.
+        """
+        missing = [uid for uid in instrument_uids if uid not in self._bond_cache]
+        if missing:
+            from tinkoff.invest import InstrumentIdType
+
+            uid_type = InstrumentIdType.INSTRUMENT_ID_TYPE_UID
+            now = datetime.now(timezone.utc)
+            horizon = now + timedelta(days=370 * 5)  # up to ~5y of coupons
+            with self._open() as client:
+                for uid in missing:
+                    try:
+                        bond = client.instruments.bond_by(id_type=uid_type, id=uid).instrument
+                        coupons: list[dict[str, Any]] = []
+                        try:
+                            response = client.instruments.get_bond_coupons(
+                                instrument_id=uid, from_=now, to=horizon
+                            )
+                            for event in response.events:
+                                coupons.append(
+                                    {"date": _date(event.coupon_date), "amount_per_bond": _money(event.pay_one_bond)}
+                                )
+                        except Exception:
+                            coupons = []
+                        nominal = getattr(bond, "nominal", None)
+                        self._bond_cache[uid] = {
+                            "maturity_date": _date(getattr(bond, "maturity_date", None)),
+                            "offer_date": _date(getattr(bond, "call_date", None)),
+                            "nominal": _money(nominal),
+                            "currency": (getattr(nominal, "currency", "") or _BASE_CURRENCY).upper(),
+                            "coupon_quantity_per_year": int(getattr(bond, "coupon_quantity_per_year", 0) or 0),
+                            "amortization": bool(getattr(bond, "amortization_flag", False)),
+                            "perpetual": bool(getattr(bond, "perpetual_flag", False)),
+                            "floating": bool(getattr(bond, "floating_coupon_flag", False)),
+                            "coupons": [c for c in coupons if c["date"]],
+                        }
+                    except Exception:
+                        self._bond_cache[uid] = {
+                            "maturity_date": None, "offer_date": None, "nominal": 0.0,
+                            "currency": _BASE_CURRENCY, "coupon_quantity_per_year": 0,
+                            "amortization": False, "perpetual": False, "floating": False, "coupons": [],
+                        }
+        return {uid: self._bond_cache[uid] for uid in instrument_uids}
 
 
 def build_broker_adapter() -> BrokerAdapter:
