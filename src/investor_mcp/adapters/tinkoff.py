@@ -2,12 +2,23 @@
 
 from __future__ import annotations
 
+import collections
+import logging
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
 
+from ..errors import describe_error
 from ..models import Account, Instrument, Money, Operation, Position
 
+logger = logging.getLogger(__name__)
+
+# Per-RPC deadline (seconds). Tinkoff RPCs normally finish well under a second, so
+# this only bites when the API is unreachable (network / TLS): it bounds how long a
+# tool call can hang, so the MCP client (~60 s budget) gets an honest stale answer
+# instead of a client-side timeout. 0 / None disables it.
+DEFAULT_TIMEOUT_SECONDS = 20.0
 
 # Tinkoff instrument_type -> our asset_class.
 _ASSET_CLASS = {
@@ -176,12 +187,77 @@ def map_operation(account_id: str, item: Any) -> Operation:
     )
 
 
+def _deadline_interceptor(timeout: float) -> Any:
+    """gRPC client interceptor that puts ``timeout`` on every unary call lacking one.
+
+    The SDK issues its calls without a deadline, so with the API unreachable a call
+    can hang for as long as gRPC keeps retrying the connection.
+    """
+    import grpc
+
+    class _Details(
+        collections.namedtuple("_Details", "method timeout metadata credentials wait_for_ready compression"),
+        grpc.ClientCallDetails,
+    ):
+        pass
+
+    class _Deadline(grpc.UnaryUnaryClientInterceptor):
+        def intercept_unary_unary(self, continuation, client_call_details, request):  # type: ignore[override]
+            details = client_call_details
+            if details.timeout is None:
+                details = _Details(
+                    details.method,
+                    timeout,
+                    details.metadata,
+                    details.credentials,
+                    details.wait_for_ready,
+                    getattr(details, "compression", None),
+                )
+            return continuation(details, request)
+
+    return _Deadline()
+
+
+class _TrustedClient:
+    """``tinkoff.invest.Client`` look-alike with an explicit root-CA bundle.
+
+    The SDK builds its channel with gRPC's default roots, which (like most trust
+    stores outside Russia) do not include the Ministry of Digital Development
+    (Минцифры) root that T-Bank moved its API certificates to in August 2026. This
+    client hands the PEM bundle from ``TINKOFF_INVEST_CA_BUNDLE`` straight to gRPC.
+    """
+
+    def __init__(self, token: str, *, target: str, root_certificates: bytes, interceptors: list[Any]) -> None:
+        import grpc
+
+        options = [("grpc.max_receive_message_length", 10 * 1024 * 1024)]  # same as the SDK
+        credentials = grpc.ssl_channel_credentials(root_certificates=root_certificates)
+        channel = grpc.secure_channel(target, credentials, options)
+        for interceptor in interceptors:
+            channel = grpc.intercept_channel(channel, interceptor)
+        self._channel = channel
+        self._token = token
+
+    def __enter__(self) -> Any:
+        from tinkoff.invest.services import Services
+
+        return Services(self._channel.__enter__(), token=self._token)
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+        self._channel.__exit__(exc_type, exc, tb)
+        return False
+
+
 class TinkoffInvestAdapter:
     """Read-only Tinkoff Invest API adapter built on the ``invest-python`` SDK.
 
     Only read methods are ever called (accounts, portfolio, operations,
     instruments, prices). No order-placing methods are used. ``client_factory``
     is injectable so the mapping can be unit-tested without the SDK or network.
+
+    Transport knobs: ``target`` overrides the gRPC endpoint (``host[:port]``),
+    ``ca_bundle`` is a PEM file of root CAs to trust instead of gRPC's defaults,
+    ``timeout_seconds`` is the per-RPC deadline (``None``/0 = no deadline).
     """
 
     def __init__(
@@ -190,10 +266,17 @@ class TinkoffInvestAdapter:
         *,
         sandbox: bool = False,
         client_factory: Callable[[], Any] | None = None,
+        target: str | None = None,
+        ca_bundle: str | None = None,
+        timeout_seconds: float | None = DEFAULT_TIMEOUT_SECONDS,
     ) -> None:
         self.token = token
         self.sandbox = sandbox
+        self.target = target
+        self.ca_bundle = ca_bundle
+        self.timeout_seconds = timeout_seconds
         self._client_factory = client_factory
+        self._root_certificates: bytes | None = None
         self._instrument_cache: dict[str, Instrument] = {}
         self._brand_cache: dict[str, str | None] = {}
         self._bond_cache: dict[str, dict[str, Any]] = {}
@@ -203,11 +286,17 @@ class TinkoffInvestAdapter:
         if self._client_factory is not None:
             return self._client_factory()
         from tinkoff.invest import Client
-        from tinkoff.invest.constants import INVEST_GRPC_API_SANDBOX
+        from tinkoff.invest.constants import INVEST_GRPC_API, INVEST_GRPC_API_SANDBOX
 
-        if self.sandbox:
-            return Client(self.token, target=INVEST_GRPC_API_SANDBOX)
-        return Client(self.token)
+        target = self.target or (INVEST_GRPC_API_SANDBOX if self.sandbox else INVEST_GRPC_API)
+        interceptors = [_deadline_interceptor(self.timeout_seconds)] if self.timeout_seconds else []
+        if self.ca_bundle:
+            if self._root_certificates is None:
+                self._root_certificates = Path(self.ca_bundle).expanduser().read_bytes()
+            return _TrustedClient(
+                self.token, target=target, root_certificates=self._root_certificates, interceptors=interceptors
+            )
+        return Client(self.token, target=target, interceptors=interceptors)
 
     def _raw_accounts(self, client: Any) -> list[Any]:
         if self.sandbox:
@@ -236,8 +325,8 @@ class TinkoffInvestAdapter:
                 price = _money(getattr(last, "price", None))
                 if iso and price:
                     rates[iso] = price / nominal
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001 — FX is best effort; positions still load
+            logger.warning("FX rates unavailable, foreign positions valued 1:1: %s", describe_error(exc))
         return rates
 
     def _instrument_meta(self, client: Any, pos: Any) -> Instrument:
@@ -259,7 +348,8 @@ class TinkoffInvestAdapter:
                 instr = instruments.etf_by(id_type=uid_type, id=uid).instrument
             else:
                 instr = instruments.get_instrument_by(id_type=uid_type, id=uid).instrument
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 — fall back to the bare position data
+            logger.debug("Instrument lookup failed for %s: %s", uid, describe_error(exc))
             instr = None
         issuer = self._brand_name(client, getattr(instr, "asset_uid", "")) if instr is not None else None
         meta = map_instrument(pos, instr, issuer=issuer)
@@ -281,7 +371,8 @@ class TinkoffInvestAdapter:
         try:
             asset = client.instruments.get_asset_by(id=asset_uid).asset
             name = (getattr(asset.brand, "name", "") or "").strip() or None
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 — issuer falls back to the instrument name
+            logger.debug("Brand lookup failed for asset %s: %s", asset_uid, describe_error(exc))
             name = None
         self._brand_cache[asset_uid] = name
         return name
@@ -292,8 +383,10 @@ class TinkoffInvestAdapter:
 
     def get_positions(self, account_ids: list[str] | None = None) -> list[Position]:
         with self._open() as client:
-            fx = self._fx_rates(client)
+            # Accounts first: when the API is unreachable this fails fast (one deadline)
+            # instead of first burning a deadline inside the best-effort FX lookup.
             ids = account_ids or [str(getattr(a, "id", "")) for a in self._raw_accounts(client)]
+            fx = self._fx_rates(client)
             positions: list[Position] = []
             for account_id in ids:
                 portfolio = self._portfolio(client, account_id)
@@ -383,7 +476,8 @@ class TinkoffInvestAdapter:
                             "floating": bool(getattr(bond, "floating_coupon_flag", False)),
                             "coupons": [c for c in coupons if c["date"]],
                         }
-                    except Exception:
+                    except Exception as exc:  # noqa: BLE001 — one bad bond must not sink the calendar
+                        logger.warning("Bond data unavailable for %s: %s", uid, describe_error(exc))
                         self._bond_cache[uid] = {
                             "maturity_date": None, "offer_date": None, "nominal": 0.0,
                             "currency": _BASE_CURRENCY, "coupon_quantity_per_year": 0,
@@ -412,7 +506,8 @@ class TinkoffInvestAdapter:
                             net = getattr(dividend, "dividend_net", None)
                             currency = (getattr(net, "currency", "") or _BASE_CURRENCY).upper()
                             annual += _money(net) * fx.get(currency, 1.0)
-                    except Exception:
+                    except Exception as exc:  # noqa: BLE001 — missing dividends just count as 0
+                        logger.warning("Dividend data unavailable for %s: %s", uid, describe_error(exc))
                         annual = 0.0
                     self._dividend_cache[uid] = {"annual_dividend_per_share": round(annual, 4)}
         return {uid: self._dividend_cache[uid] for uid in instrument_uids}

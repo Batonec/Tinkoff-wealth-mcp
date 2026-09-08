@@ -204,10 +204,10 @@ class InvestorServiceTest(unittest.TestCase):
         result = service.get_sync_status()
 
         self.assertTrue(result["ok"])
-        self.assertEqual(
-            set(result["data"]),
-            {"last_success_at", "last_attempt_at", "status", "data_status", "stale_sections"},
-        )
+        contract_keys = {"last_success_at", "last_attempt_at", "status", "data_status", "stale_sections"}
+        self.assertTrue(contract_keys <= set(result["data"]))
+        self.assertEqual(result["data"]["status"], "success")
+        self.assertEqual(result["data"]["stale_sections"], [])
 
     def test_get_operations_filters_and_resource(self) -> None:
         service = InvestorService()

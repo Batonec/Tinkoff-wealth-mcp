@@ -28,7 +28,7 @@ class ResearchMixin:
             return ok_response(
                 "Портфель пуст — искать нечего.",
                 {"period": period, "research_targets": [], "guidance": "", "events": []},
-                data_status=self._positions_status,
+                **self._meta("positions"),
             )
 
         issuer_value: dict[str, float] = defaultdict(float)
@@ -146,7 +146,7 @@ class ResearchMixin:
             f"Бриф для поиска новостей: {len(targets)} целей. {guidance} "
             "Найди по ним свежие новости в вебе и оцени влияние на портфель."
         )
-        return ok_response(summary, data, data_status=self._positions_status)
+        return ok_response(summary, data, **self._meta("positions"))
 
     def _context_lenses(self, positions: list[Position], total: float) -> list[dict[str, Any]]:
         """External factors to research, DERIVED from the portfolio's exposures.

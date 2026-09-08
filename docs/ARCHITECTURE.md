@@ -65,7 +65,18 @@ service/         transport-agnostic «голова» — InvestorService соб�
 
 - Брокер опрашивается **раз в сутки**, а не на каждый запрос (десятки→сотни вызовов экономятся).
 - Принудительно: `investor_sync_data` или `investor_get_portfolio(refresh=true)`.
-- `sync_data` тянет из API **портфель + операции** и пишет снимок портфеля.
+- `sync_data` тянет из API **счета + портфель + операции** и пишет снимок портфеля.
+- `stale` — всегда **явный** сигнал, а не тихий откат: в `warnings` пишется ошибка брокера,
+  дата кэша и подсказка, что проверить; `as_of` = время выгрузки данных (а не «сейчас»).
+  Разделы (`accounts` / `positions` / `operations`) отслеживаются независимо.
+- `investor_sync_data` при недоступном брокере честно возвращает `status: partial` +
+  `stale_sections` (без кэша — ошибку `BROKER_*`), а `investor_get_sync_status` считает
+  свежесть по возрасту кэша и последней ошибке брокера, а не по отчёту синка.
+- После ошибки брокер не опрашивается 60 с (`broker_retry_cooldown_seconds`), чтобы цепочка
+  тулов во время сбоя не стоила по таймауту каждая; принудительные обновления — исключение.
+- На каждый gRPC-вызов ставится дедлайн (`TINKOFF_INVEST_TIMEOUT_SECONDS`, 20 с): зависший
+  API не блокирует тул дольше бюджета MCP-клиента. Ошибки брокера пишутся в лог
+  (`journalctl -u investor-mcp`). Диагностика — в [DEPLOYMENT.md](DEPLOYMENT.md).
 
 ## Оценка стоимости (сходится с брокером до копейки)
 
@@ -92,6 +103,9 @@ service/         transport-agnostic «голова» — InvestorService соб�
 | --- | --- | --- |
 | `TINKOFF_INVEST_TOKEN` | _(пусто → mock)_ | Токен Tinkoff Invest API. Пусто = read-only mock-данные. |
 | `TINKOFF_INVEST_SANDBOX` | `false` | Sandbox вместо боевого API. |
+| `TINKOFF_INVEST_TARGET` | _(пусто → константа SDK)_ | gRPC-эндпоинт `host[:port]`, напр. `invest-public-api.tbank.ru:443`. |
+| `TINKOFF_INVEST_CA_BUNDLE` | _(пусто → корни gRPC по умолчанию)_ | PEM-файл корневых сертификатов (сертификат Минцифры). |
+| `TINKOFF_INVEST_TIMEOUT_SECONDS` | `20` | Дедлайн на один gRPC-вызов; `0` — без дедлайна. |
 | `INVESTOR_MCP_STORAGE_PATH` | `./data/investor_mcp.db` | Путь к SQLite. |
 | `INVESTOR_MCP_CACHE_TTL_SECONDS` | `86400` | TTL кэша состава (1 сутки). |
 | `INVESTOR_MCP_AUTH_TOKEN` | _(пусто → без auth)_ | Если задан — требуется `Authorization: Bearer …`. |

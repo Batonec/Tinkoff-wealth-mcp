@@ -26,7 +26,7 @@ class RiskMixin:
         return ok_response(
             "Риски просканированы.",
             {"risk_signals": filtered, "resource": "investor://risks/current"},
-            data_status=self._positions_status,
+            **self._meta("positions"),
         )
 
     def _compute_risk_signals(self, positions: list[Position], total: float) -> list[dict[str, Any]]:

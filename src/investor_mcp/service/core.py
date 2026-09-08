@@ -6,10 +6,11 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ..adapters import BrokerAdapter, MockBrokerAdapter
+from ..errors import classify_broker_error, describe_error, error_hint
 from ..models import Account, InvestorProfile, Operation, Position, utc_now_iso
 from ..responses import error_response, ok_response
 from ..storage import Storage
-from .cache import CacheMixin
+from .cache import SECTIONS, CacheMixin
 from .portfolio import PortfolioMixin
 from .risk import RiskMixin
 from .bonds import BondMixin
@@ -35,14 +36,22 @@ class InvestorService(
     recommendations: dict[str, dict[str, Any]] = field(default_factory=dict)
     reports: dict[str, str] = field(default_factory=dict)
     storage: Storage | None = None
-    # Portfolio-composition data (positions, accounts) is cached for this long so
-    # the read tools don't hit the broker on every call. Default: 1 day.
+    # Portfolio-composition data (positions, accounts, operations) is cached for this
+    # long so the read tools don't hit the broker on every call. Default: 1 day.
     cache_ttl_seconds: int = 86400
+    # After a broker failure the broker is not retried for this long (forced refreshes
+    # still are), so a chain of tool calls during an outage costs one timeout, not N.
+    broker_retry_cooldown_seconds: int = 60
     _positions_cache: tuple[float, list[Position]] | None = field(default=None, repr=False)
     _accounts_cache: tuple[float, list[Account]] | None = field(default=None, repr=False)
     _operations_cache: tuple[float, list[Operation]] | None = field(default=None, repr=False)
-    _positions_status: str = field(default="fresh", repr=False)
-    _operations_status: str = field(default="fresh", repr=False)
+    # Per-section freshness of the LAST read: fresh / cached / stale (see CacheMixin).
+    _accounts_status: str = field(default="cached", repr=False)
+    _positions_status: str = field(default="cached", repr=False)
+    _operations_status: str = field(default="cached", repr=False)
+    # section -> {"error": text, "at": iso}; persisted so a restart doesn't hide the cause.
+    _broker_errors: dict[str, dict[str, str]] = field(default_factory=dict, repr=False)
+    _broker_retry_after: float = field(default=0.0, repr=False)
 
     def __post_init__(self) -> None:
         """Hydrate persisted singletons from storage, if attached."""
@@ -57,6 +66,9 @@ class InvestorService(
         last_sync = self.storage.get_setting("last_sync")
         if last_sync:
             self.last_sync = last_sync
+        errors = self.storage.get_setting("broker_errors")
+        if errors:
+            self._broker_errors = dict(errors)
 
     def sync_data(
         self,
@@ -66,49 +78,128 @@ class InvestorService(
         from_date: str | None = None,
         to_date: str | None = None,
     ) -> dict[str, Any]:
+        """Force-refresh accounts, positions and operations from the broker.
+
+        Honest about failures: a section the broker could not deliver is served from
+        the last cache and listed in ``stale_sections`` (status ``partial``); when the
+        broker is unreachable and there is no cache to fall back on, the tool returns a
+        ``BROKER_*`` error instead of pretending the sync succeeded.
+        """
         started = utc_now_iso()
-        # Sync = force-refresh the cached data: accounts, portfolio AND operations.
-        accounts = self._cached_accounts(force=True)
-        positions = self._all_positions(force=True)
-        operations = self._all_operations(force=True)
-        finished = utc_now_iso()
+        previous = dict(self.last_sync or {})
         stamp = started.replace("-", "").replace(":", "").replace("T", "_").rstrip("Z")
-        self.last_sync = {
-            "sync_id": f"sync_{stamp}",
-            "mode": mode,
-            "started_at": started,
-            "finished_at": finished,
-            "accounts_synced": len(accounts),
-            "positions_synced": len(positions),
-            "operations_synced": len(operations),
-            "prices_synced": len({p.instrument.instrument_id for p in positions}),
-            "status": "success",
-        }
-        if self.storage is not None:
-            self.last_sync["snapshot_id"] = self.last_sync["sync_id"]
-            self.storage.set_setting("last_sync", self.last_sync)
+        record: dict[str, Any] = {"sync_id": f"sync_{stamp}", "mode": mode, "started_at": started}
+        try:
+            accounts = self._cached_accounts(force=True)
+            if self._accounts_status == "fresh":
+                positions = self._all_positions(force=True)
+                operations = self._all_operations(force=True)
+            else:
+                # The broker is unreachable: don't spend two more timeouts on calls that
+                # will fail the same way — keep the last known data and mark it stale.
+                error = self._last_broker_error("accounts")
+                positions = self._degrade("positions", error)
+                operations = self._degrade("operations", error)
+        except Exception as exc:  # noqa: BLE001 — broker down and no cache to fall back on
+            error = describe_error(exc)
+            record.update(
+                finished_at=utc_now_iso(),
+                status="failed",
+                error=error,
+                stale_sections=list(SECTIONS),
+                last_success_at=self._last_success_at(previous),
+            )
+            self._save_last_sync(record)
+            hint = error_hint(error)
+            return error_response(
+                classify_broker_error(exc),
+                f"Синхронизация не удалась: {error}. Кэша для отката нет.",
+                {"error": error, "hint": hint, "sync": dict(record)},
+                warnings=[hint] if hint else None,
+            )
+
+        finished = utc_now_iso()
+        stale = [section for section in SECTIONS if getattr(self, f"_{section}_status") == "stale"]
+        status = "success" if not stale else "partial"
+        warnings = [self._stale_warning(section) for section in stale]
+        record.update(
+            finished_at=finished,
+            accounts_synced=len(accounts),
+            positions_synced=len(positions),
+            operations_synced=len(operations),
+            prices_synced=len({p.instrument.instrument_id for p in positions}),
+            status=status,
+            stale_sections=stale,
+            last_success_at=finished if status == "success" else self._last_success_at(previous),
+            warnings=warnings,
+        )
+        if self.storage is not None and self._positions_status == "fresh":
+            # Snapshot only genuinely refreshed data: a stale copy would just duplicate
+            # the previous snapshot under a new id.
+            record["snapshot_id"] = record["sync_id"]
+            self._save_last_sync(record)
             snapshot = self.get_portfolio(account_ids)["data"]
-            self.storage.save_snapshot(self.last_sync["sync_id"], snapshot, created_at=finished)
-        return ok_response("Данные синхронизированы.", dict(self.last_sync))
+            self.storage.save_snapshot(record["sync_id"], snapshot, created_at=finished)
+        else:
+            self._save_last_sync(record)
+        if status == "success":
+            summary = "Данные синхронизированы."
+        else:
+            summary = (
+                "Синхронизация частичная: брокер недоступен, разделы "
+                + ", ".join(stale)
+                + " отданы из кэша (подробности в warnings)."
+            )
+        return ok_response(
+            summary,
+            dict(record),
+            data_status="fresh" if status == "success" else "stale",
+            warnings=warnings,
+        )
 
     def get_sync_status(self) -> dict[str, Any]:
-        if not self.last_sync:
-            data = {
-                "last_success_at": None,
-                "last_attempt_at": None,
-                "status": "not_synced",
-                "data_status": "stale",
-                "stale_sections": ["portfolio", "operations", "prices"],
-            }
-            return ok_response("Данные еще не синхронизированы.", data, data_status="stale")
+        """Freshness of every cached section plus the outcome of the last sync attempt.
+
+        ``data_status``/``stale_sections`` are derived from the caches themselves (age
+        vs TTL, last broker error), not from what the last sync claimed.
+        """
+        sections = {section: self._section_state(section) for section in SECTIONS}
+        stale_sections = [
+            section for section, state in sections.items() if state["status"] in {"stale", "unavailable"}
+        ]
+        data_status = "stale" if stale_sections else "fresh"
+        last = self.last_sync or {}
         data = {
-            "last_success_at": self.last_sync["finished_at"],
-            "last_attempt_at": self.last_sync["finished_at"],
-            "status": self.last_sync["status"],
-            "data_status": "fresh",
-            "stale_sections": [],
+            "last_success_at": self._last_success_at(last),
+            "last_attempt_at": last.get("finished_at"),
+            "status": last.get("status", "not_synced"),
+            "data_status": data_status,
+            "stale_sections": stale_sections,
+            "sections": sections,
+            "cache_ttl_seconds": self.cache_ttl_seconds,
         }
-        return ok_response("Статус синхронизации получен.", data)
+        warnings = [self._stale_warning(section) for section in stale_sections if sections[section]["fetched_at"]]
+        if not last and not any(state["fetched_at"] for state in sections.values()):
+            summary = "Данные еще не синхронизированы."
+        elif stale_sections:
+            summary = "Данные устарели: " + "; ".join(
+                f"{section} — кэш от {sections[section]['fetched_at'] or 'нет данных'}"
+                for section in stale_sections
+            ) + ". Брокер недоступен или давно не опрашивался."
+        else:
+            summary = "Данные актуальны."
+        return ok_response(summary, data, data_status=data_status, warnings=warnings)
+
+    @staticmethod
+    def _last_success_at(last: dict[str, Any]) -> str | None:
+        if last.get("last_success_at"):
+            return last["last_success_at"]
+        return last.get("finished_at") if last.get("status") == "success" else None
+
+    def _save_last_sync(self, record: dict[str, Any]) -> None:
+        self.last_sync = record
+        if self.storage is not None:
+            self.storage.set_setting("last_sync", record)
 
     def get_profile(self) -> dict[str, Any]:
         return ok_response("Инвестиционный профиль получен.", self.profile.to_dict())
@@ -132,7 +223,7 @@ class InvestorService(
             item = account.to_dict()
             item["included_in_analysis"] = account.account_id in selected
             data.append(item)
-        return ok_response("Счета получены.", {"accounts": data})
+        return ok_response("Счета получены.", {"accounts": data}, **self._meta("accounts"))
 
     def select_accounts(self, account_ids: list[str]) -> dict[str, Any]:
         known_ids = {account.account_id for account in self._cached_accounts()}

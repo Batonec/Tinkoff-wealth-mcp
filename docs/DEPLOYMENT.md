@@ -81,3 +81,56 @@ journalctl -u investor-mcp -n 100 --no-pager   # logs (no secrets logged)
 # rotate the Tinkoff token: edit /opt/investor-mcp/.env then:
 systemctl restart investor-mcp
 ```
+
+## Данные не обновляются (`data_status: stale`)
+
+**Симптомы.** Тулы отвечают `data_status: "stale"` с предупреждением «брокер недоступен
+(…)», `investor_get_sync_status` показывает `stale_sections`, последняя сделка «застыла»
+на старой дате, хотя вы торговали позже. Значит, каждый поход в Tinkoff Invest API падает
+и сервер отдаёт последний удачный кэш (дата — в `as_of` и в `sections.*.fetched_at`).
+
+**1. Причина** — в тексте предупреждения (`warnings`) и в логах сервера:
+
+```bash
+journalctl -u investor-mcp -n 300 --no-pager | grep -iE "broker|unavailable|unauthenticated|deadline|ssl|handshake"
+```
+
+**2. Проверка API прямо с VPS** (тем же токеном и SDK, что использует сервер):
+
+```bash
+cd /opt/investor-mcp && set -a && . ./.env && set +a && .venv/bin/python - <<'EOF'
+import os
+from tinkoff.invest import Client
+with Client(os.environ["TINKOFF_INVEST_TOKEN"]) as client:
+    print([account.name for account in client.users.get_accounts().accounts])
+EOF
+```
+
+**3. Типичные ошибки и что делать.**
+
+| В ошибке | Причина | Что делать |
+| --- | --- | --- |
+| `Ssl handshake failed … CERTIFICATE_VERIFY_FAILED` | С 3 августа 2026 сертификаты API T-Bank (`invest-public-api.tinkoff.ru` / `.tbank.ru`) выпущены под корнем **Минцифры** (пост T_InvestAPI «Отзыв старого сертификата и переход домена tinkoff.ru на сертификат Минцифры»). Его нет в стандартных доверенных корнях, gRPC рвёт TLS. | Установить корневой и промежуточный сертификаты Минцифры (см. ниже) **или** указать `TINKOFF_INVEST_CA_BUNDLE`. |
+| `UNAUTHENTICATED` / `40003` | Токен отозван или истёк. | Выпустить новый токен, обновить `TINKOFF_INVEST_TOKEN` в `.env`, `systemctl restart investor-mcp`. |
+| `DEADLINE_EXCEEDED` / `failed to connect to all addresses` без слов про SSL | Сеть: с VPS нет доступа к API (файрвол, блокировка зарубежных IP). | `curl -v https://invest-public-api.tbank.ru:443/` с VPS; при необходимости хостинг с российским IP. |
+| `RESOURCE_EXHAUSTED` / `30042` | Лимит запросов в минуту. | Подождать; повторный `investor_sync_data`. |
+
+**Сертификаты Минцифры (Ubuntu/Debian).** Официальная страница — <https://www.gosuslugi.ru/crt>
+(сверьте отпечатки с опубликованными там):
+
+```bash
+curl -fsSL https://gu-st.ru/content/lending/russian_trusted_root_ca_pem.crt \
+  -o /usr/local/share/ca-certificates/russian_trusted_root_ca.crt
+curl -fsSL https://gu-st.ru/content/lending/russian_trusted_sub_ca_pem.crt \
+  -o /usr/local/share/ca-certificates/russian_trusted_sub_ca.crt
+update-ca-certificates
+systemctl restart investor-mcp
+```
+
+gRPC на Linux читает системный набор `/etc/ssl/certs/ca-certificates.crt`, поэтому после
+`update-ca-certificates` ничего настраивать не нужно. Альтернатива без правки системного
+хранилища: положить PEM-бандл (оба сертификата подряд) в файл и указать его в
+`TINKOFF_INVEST_CA_BUNDLE=/opt/investor-mcp/russian_trusted_ca.pem`.
+
+**4. Проверка.** `investor_sync_data` → `status: "success"`, `stale_sections: []`;
+`investor_get_operations` за последние дни показывает свежие сделки.

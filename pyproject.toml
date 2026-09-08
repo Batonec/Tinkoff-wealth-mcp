@@ -9,7 +9,8 @@ description = "Personal investment assistant MCP server"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "mcp>=1.0.0",
+    # mcp 2.x renamed FastMCP -> MCPServer and changed the server API; stay on 1.x.
+    "mcp>=1.0.0,<2",
     "python-dotenv>=1.0.0",
 ]
 

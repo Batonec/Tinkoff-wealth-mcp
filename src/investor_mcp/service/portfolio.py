@@ -29,7 +29,7 @@ class PortfolioMixin:
             data["positions"] = [position.to_dict(total) for position in positions]
         if include_allocation:
             data["allocation"] = self._allocation_payload(positions, total)
-        return ok_response("Портфель получен.", data, data_status=self._positions_status)
+        return ok_response("Портфель получен.", data, **self._meta("positions"))
 
     def analyze_portfolio(
         self,
@@ -54,7 +54,7 @@ class PortfolioMixin:
             "goal_deviation": goal_deviation,
             "key_findings": findings,
         }
-        return ok_response("Портфель проанализирован.", data, data_status=self._positions_status)
+        return ok_response("Портфель проанализирован.", data, **self._meta("positions"))
 
     def explain_portfolio_change(
         self,
@@ -95,7 +95,7 @@ class PortfolioMixin:
             "related_events": self._mock_events() if include_news else [],
             "interpretation": "Основной вклад рассчитан по разнице средней и текущей цены mock-позиций.",
         }
-        return ok_response("Изменение портфеля объяснено.", data, data_status="cached")
+        return ok_response("Изменение портфеля объяснено.", data, **self._meta("positions"))
 
     def get_operations(
         self,
@@ -134,7 +134,7 @@ class PortfolioMixin:
                 "total_count": len(operations),
                 "resource": f"investor://operations/{account_key}/{from_date}/{to_date}",
             },
-            data_status=self._operations_status,
+            **self._meta("operations"),
         )
 
     def get_instrument(
@@ -163,7 +163,7 @@ class PortfolioMixin:
             "events": self._mock_events(instrument_id) if include_events else [],
             "resource": f"investor://positions/{instrument_id}",
         }
-        return ok_response("Инструмент найден.", data, data_status=self._positions_status)
+        return ok_response("Инструмент найден.", data, **self._meta("positions"))
 
     # Net value change a single action applies to a position.
     _ADD_ACTIONS = {"buy", "increase"}
@@ -259,7 +259,7 @@ class PortfolioMixin:
             ),
             "disclaimer": "Аналитический сценарий, реальная сделка не выставляется.",
         }
-        return ok_response("Действия смоделированы.", data)
+        return ok_response("Действия смоделированы.", data, **self._meta("positions"))
 
     def research_instrument(
         self,
@@ -328,14 +328,16 @@ class PortfolioMixin:
             "events": self._mock_events(instr.instrument_id),
             "resource": f"investor://research/{instr.instrument_id}/{date}",
         }
+        meta = self._meta("positions")
         return ok_response(
             f"Исследование по {instr.ticker} подготовлено (черновик).",
             data,
             data_status="partial",
+            as_of=meta["as_of"],
             warnings=[
                 "Внешние источники (OpenAI/новости/рейтинги/отчётность) пока не подключены: "
                 "исследование строится только на брокерских данных и mock-событиях."
-            ],
+            ] + meta["warnings"],
         )
 
     def _snapshot(self, positions: list[Position]) -> dict[str, Any]:

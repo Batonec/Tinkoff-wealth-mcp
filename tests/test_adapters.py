@@ -266,6 +266,42 @@ class TinkoffAdapterTest(unittest.TestCase):
         self.assertEqual(len(operations), 2)
         self.assertEqual(operations[0].operation_type, "buy")
 
+    def test_get_positions_fails_fast_when_accounts_unreachable(self) -> None:
+        calls = {"currencies": 0}
+
+        def unreachable():
+            raise RuntimeError("UNAVAILABLE: failed to connect to all addresses")
+
+        def currencies():
+            calls["currencies"] += 1
+            return SimpleNamespace(instruments=[])
+
+        class DownClient:
+            users = SimpleNamespace(get_accounts=unreachable)
+            instruments = SimpleNamespace(currencies=currencies)
+            market_data = SimpleNamespace(get_last_prices=lambda instrument_id=None: SimpleNamespace(last_prices=[]))
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        adapter = TinkoffInvestAdapter("t", client_factory=lambda: DownClient())
+
+        with self.assertRaises(RuntimeError):
+            adapter.get_positions()
+
+        self.assertEqual(calls["currencies"], 0)  # accounts are asked first; FX never attempted
+
+    def test_transport_defaults(self) -> None:
+        from investor_mcp.adapters.tinkoff import DEFAULT_TIMEOUT_SECONDS
+
+        adapter = TinkoffInvestAdapter("t")
+        self.assertIsNone(adapter.target)
+        self.assertIsNone(adapter.ca_bundle)
+        self.assertEqual(adapter.timeout_seconds, DEFAULT_TIMEOUT_SECONDS)
+
 
 class MockBondDataTest(unittest.TestCase):
     def test_mock_get_bond_data(self) -> None:
@@ -276,8 +312,18 @@ class MockBondDataTest(unittest.TestCase):
 
 
 class BuildBrokerAdapterTest(unittest.TestCase):
+    ENV_KEYS = (
+        "TINKOFF_INVEST_TOKEN",
+        "TINKOFF_INVEST_SANDBOX",
+        "TINKOFF_INVEST_TARGET",
+        "TINKOFF_INVEST_CA_BUNDLE",
+        "TINKOFF_INVEST_TIMEOUT_SECONDS",
+    )
+
     def setUp(self) -> None:
-        self._saved = {k: os.environ.get(k) for k in ("TINKOFF_INVEST_TOKEN", "TINKOFF_INVEST_SANDBOX")}
+        self._saved = {key: os.environ.get(key) for key in self.ENV_KEYS}
+        for key in self.ENV_KEYS:
+            os.environ.pop(key, None)
 
     def tearDown(self) -> None:
         for key, value in self._saved.items():
@@ -285,6 +331,28 @@ class BuildBrokerAdapterTest(unittest.TestCase):
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
+
+    def test_transport_env_knobs(self) -> None:
+        os.environ["TINKOFF_INVEST_TOKEN"] = "secret"
+        os.environ["TINKOFF_INVEST_TARGET"] = "invest-public-api.tbank.ru:443"
+        os.environ["TINKOFF_INVEST_CA_BUNDLE"] = "/etc/ssl/certs/ca-certificates.crt"
+        os.environ["TINKOFF_INVEST_TIMEOUT_SECONDS"] = "7.5"
+
+        adapter = build_broker_adapter()
+
+        self.assertEqual(adapter.target, "invest-public-api.tbank.ru:443")
+        self.assertEqual(adapter.ca_bundle, "/etc/ssl/certs/ca-certificates.crt")
+        self.assertEqual(adapter.timeout_seconds, 7.5)
+
+    def test_timeout_env_zero_disables_deadline_and_default_applies(self) -> None:
+        from investor_mcp.adapters.tinkoff import DEFAULT_TIMEOUT_SECONDS
+
+        os.environ["TINKOFF_INVEST_TOKEN"] = "secret"
+        self.assertEqual(build_broker_adapter().timeout_seconds, DEFAULT_TIMEOUT_SECONDS)
+        os.environ["TINKOFF_INVEST_TIMEOUT_SECONDS"] = "0"
+        self.assertIsNone(build_broker_adapter().timeout_seconds)
+        os.environ["TINKOFF_INVEST_TIMEOUT_SECONDS"] = "not-a-number"
+        self.assertEqual(build_broker_adapter().timeout_seconds, DEFAULT_TIMEOUT_SECONDS)
 
     def test_without_token_returns_mock(self) -> None:
         os.environ.pop("TINKOFF_INVEST_TOKEN", None)

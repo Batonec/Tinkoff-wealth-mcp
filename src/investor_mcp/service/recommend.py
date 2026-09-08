@@ -77,4 +77,5 @@ class RecommendMixin:
                 ),
                 "disclaimer": "Аналитический сценарий, не гарантия результата.",
             },
+            **self._meta("positions"),
         )

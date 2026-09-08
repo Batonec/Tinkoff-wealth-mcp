@@ -12,11 +12,14 @@ def ok_response(
     data: dict[str, Any],
     data_status: str = "fresh",
     warnings: list[str] | None = None,
+    as_of: str | None = None,
 ) -> dict[str, Any]:
+    """Success envelope. ``as_of`` is the timestamp of the DATA (defaults to now);
+    cached/stale answers pass the time the data was actually fetched."""
     return {
         "ok": True,
         "data_status": data_status,
-        "as_of": utc_now_iso(),
+        "as_of": as_of or utc_now_iso(),
         "summary": summary,
         "data": data,
         "warnings": warnings or [],

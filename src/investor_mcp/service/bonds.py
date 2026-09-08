@@ -29,14 +29,16 @@ class BondMixin:
             "horizon_days": horizon_days,
         }
         if not bonds:
-            return ok_response("Облигаций в портфеле нет.", empty, data_status=self._positions_status)
+            return ok_response("Облигаций в портфеле нет.", empty, **self._meta("positions"))
         fetch = getattr(self.broker, "get_bond_data", None)
         if fetch is None:
+            meta = self._meta("positions")
             return ok_response(
                 "Источник не поддерживает данные по облигациям.",
                 empty,
                 data_status="partial",
-                warnings=["Текущий брокерский адаптер не отдаёт расписание купонов."],
+                as_of=meta["as_of"],
+                warnings=["Текущий брокерский адаптер не отдаёт расписание купонов."] + meta["warnings"],
             )
 
         bond_data = fetch([bond.instrument.instrument_id for bond in bonds])
@@ -121,7 +123,7 @@ class BondMixin:
             f"Бонд-календарь на {horizon_days} дн.: {len(events)} событий; "
             f"купонный доход за 12 мес ≈ {round(income_12m):,} {base}."
         )
-        return ok_response(summary, data, data_status=self._positions_status)
+        return ok_response(summary, data, **self._meta("positions"))
 
     @staticmethod
     def _maturity_bucket(today: str, maturity: str | None, perpetual: bool) -> str:

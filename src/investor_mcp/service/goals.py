@@ -85,7 +85,7 @@ class GoalsMixin:
             f"Пассивный доход покрывает {cov_pct}% цели (≈{round(monthly_income):,} ₽/мес)." if cov_pct is not None else
             f"Пассивный доход ≈{round(monthly_income):,} ₽/мес."
         )
-        return ok_response(summary, data, data_status=self._positions_status)
+        return ok_response(summary, data, **self._meta("positions"))
 
     @staticmethod
     def _years_to(current: float, target: float, annual_add: float, rate: float) -> int | None:
