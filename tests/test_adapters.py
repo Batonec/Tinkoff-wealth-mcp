@@ -6,6 +6,7 @@ from datetime import datetime
 from types import SimpleNamespace
 
 from investor_mcp.adapters import (
+    Instrument,
     MockBrokerAdapter,
     TinkoffInvestAdapter,
     _money,
@@ -15,6 +16,8 @@ from investor_mcp.adapters import (
     map_operation,
     map_position,
 )
+from investor_mcp.adapters.tinkoff import normalize_instrument
+from investor_mcp.models import Position
 
 
 def money(units: int, nano: int = 0, currency: str = "rub") -> SimpleNamespace:
@@ -37,7 +40,11 @@ class FakeClient:
             get_operations_by_cursor=self._next_ops_page,
         )
         self.instruments = SimpleNamespace(
-            get_instrument_by=lambda **kwargs: SimpleNamespace(instrument=None)
+            get_instrument_by=lambda **kwargs: SimpleNamespace(instrument=None),
+            currencies=lambda: SimpleNamespace(instruments=[]),
+        )
+        self.market_data = SimpleNamespace(
+            get_last_prices=lambda instrument_id=None: SimpleNamespace(last_prices=[])
         )
 
     def _next_ops_page(self, request):
@@ -300,3 +307,130 @@ class BuildBrokerAdapterTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RobustnessTest(unittest.TestCase):
+    """Blocked positions, ОФЗ grouping, and no caching of failed lookups."""
+
+    @staticmethod
+    def _pos(uid, instrument_type="share", price=100, blocked=False, blocked_lots=0):
+        return SimpleNamespace(
+            instrument_uid=uid, figi=uid, instrument_type=instrument_type, ticker=uid,
+            quantity=quotation(5), average_position_price=money(90), current_price=money(price),
+            current_nkd=money(0), blocked=blocked, blocked_lots=quotation(blocked_lots),
+        )
+
+    def test_map_position_carries_broker_blocked_flag(self) -> None:
+        instr = Instrument("u", "U", "U", "stock")
+        self.assertTrue(map_position("a", self._pos("u", blocked=True), instr).blocked)
+        self.assertTrue(map_position("a", self._pos("u", blocked_lots=3), instr).blocked)
+        plain = map_position("a", self._pos("u"), instr)
+        self.assertFalse(plain.blocked)
+        self.assertTrue(plain.has_market_price)
+        self.assertFalse(map_position("a", self._pos("u", price=0), instr).has_market_price)
+        self.assertIn("blocked", plain.to_dict())
+        self.assertTrue(Position.from_dict(map_position("a", self._pos("u", blocked=True), instr).to_dict()).blocked)
+
+    def test_ofz_series_grouped_under_one_issuer_regardless_of_brand(self) -> None:
+        pos = SimpleNamespace(instrument_uid="u1", figi="f", instrument_type="bond", ticker="SU26254RMFS1")
+        instr = SimpleNamespace(uid="u1", ticker="SU26254RMFS1", name="ОФЗ 26254", currency="rub",
+                                sector="government", risk_level=None, asset_uid="a")
+        self.assertEqual(map_instrument(pos, instr, issuer="Russia2028").issuer, "ОФЗ")
+        # A corporate bond keeps its brand.
+        corp = SimpleNamespace(uid="u2", ticker="RU000A10BW96", name="Самолет П18", currency="rub",
+                               sector="real_estate", risk_level=None, asset_uid="b")
+        corp_pos = SimpleNamespace(instrument_uid="u2", figi="f", instrument_type="bond", ticker="RU000A10BW96")
+        self.assertEqual(map_instrument(corp_pos, corp, issuer="ГК Самолет").issuer, "ГК Самолет")
+        # Instruments restored from an older cache are normalized the same way.
+        old = Instrument("u1", "SU26254RMFS1", "ОФЗ 26254", "bond", issuer="Russia2028", sector="government")
+        self.assertEqual(normalize_instrument(old).issuer, "ОФЗ")
+        self.assertTrue(normalize_instrument(old).is_sovereign)
+
+    def test_failed_metadata_lookup_is_not_cached(self) -> None:
+        ns = SimpleNamespace
+        calls = {"share_by": 0}
+
+        def share_by(id_type=None, id=None):
+            calls["share_by"] += 1
+            if calls["share_by"] == 1:
+                raise RuntimeError("UNAVAILABLE")  # relay hiccup / rate limit
+            return ns(instrument=ns(uid=id, ticker="SBER", name="Сбер", currency="rub",
+                                    sector="financial", risk_level=None, asset_uid="asset"))
+
+        client = FakeClient(portfolios={"acc": ns(positions=[self._pos("u-sber")])})
+        client.instruments.share_by = share_by
+        client.instruments.get_asset_by = lambda id=None: ns(asset=ns(brand=ns(name="Сбербанк")))
+        adapter = TinkoffInvestAdapter("t", client_factory=lambda: client)
+
+        first = adapter.get_positions(["acc"])[0].instrument
+        self.assertEqual(first.sector, "unknown")  # degraded for this call only
+        second = adapter.get_positions(["acc"])[0].instrument
+        self.assertEqual((second.sector, second.issuer), ("financial", "Сбербанк"))
+        third = adapter.get_positions(["acc"])[0].instrument
+        self.assertEqual(calls["share_by"], 2)  # success is cached
+        self.assertEqual(third.issuer, "Сбербанк")
+
+    def test_seeded_metadata_skips_api_lookups(self) -> None:
+        ns = SimpleNamespace
+        lookups: list[str] = []
+
+        def share_by(id_type=None, id=None):
+            lookups.append(id)
+            return ns(instrument=ns(uid=id, ticker="SBER", name="Сбер", currency="rub",
+                                    sector="financial", risk_level=None, asset_uid=""))
+
+        client = FakeClient(portfolios={"acc": ns(positions=[self._pos("u-sber")])})
+        client.instruments.share_by = share_by
+        adapter = TinkoffInvestAdapter("t", client_factory=lambda: client)
+
+        seeded = adapter.seed_instrument_cache([
+            Instrument("u-sber", "SBER", "Сбер", "stock", issuer="Сбербанк", sector="financial"),
+            Instrument("u-unknown", "X", "X", "fund", sector="unknown"),  # skipped: retry later
+        ])
+        self.assertEqual(seeded, 1)
+        position = adapter.get_positions(["acc"])[0]
+        self.assertEqual((position.instrument.issuer, position.instrument.sector), ("Сбербанк", "financial"))
+        self.assertEqual(lookups, [])  # served from the seed, no API round-trip
+        adapter.reset_instrument_cache()
+        adapter.get_positions(["acc"])
+        self.assertEqual(lookups, ["u-sber"])  # cache cleared -> looked up again
+
+    def test_fx_catalog_failure_raises_instead_of_valuing_at_par(self) -> None:
+        ns = SimpleNamespace
+        client = FakeClient(portfolios={"acc": ns(positions=[self._pos("u")])})
+        client.instruments.currencies = lambda: (_ for _ in ()).throw(RuntimeError("UNAVAILABLE"))
+        adapter = TinkoffInvestAdapter("t", client_factory=lambda: client)
+        with self.assertRaises(RuntimeError):
+            adapter.get_positions(["acc"])
+
+    def test_bond_and_dividend_failures_are_not_cached(self) -> None:
+        ns = SimpleNamespace
+        attempts = {"bond": 0, "div": 0}
+
+        def bond_by(id_type=None, id=None):
+            attempts["bond"] += 1
+            if attempts["bond"] == 1:
+                raise RuntimeError("UNAVAILABLE")
+            return ns(instrument=ns(maturity_date=None, call_date=None, nominal=money(1000),
+                                    coupon_quantity_per_year=2, amortization_flag=False,
+                                    perpetual_flag=False, floating_coupon_flag=False))
+
+        def get_dividends(instrument_id=None, from_=None, to=None):
+            attempts["div"] += 1
+            if attempts["div"] == 1:
+                raise RuntimeError("UNAVAILABLE")
+            return ns(dividends=[ns(dividend_net=money(10))])
+
+        client = FakeClient()
+        client.instruments.bond_by = bond_by
+        client.instruments.get_bond_coupons = lambda instrument_id=None, from_=None, to=None: ns(events=[])
+        client.instruments.get_dividends = get_dividends
+        adapter = TinkoffInvestAdapter("t", client_factory=lambda: client)
+
+        self.assertEqual(adapter.get_bond_data(["b"])["b"]["nominal"], 0.0)
+        self.assertEqual(adapter.get_bond_data(["b"])["b"]["nominal"], 1000.0)
+        self.assertEqual(adapter.get_dividend_data(["s"])["s"]["annual_dividend_per_share"], 0.0)
+        self.assertEqual(adapter.get_dividend_data(["s"])["s"]["annual_dividend_per_share"], 10.0)
+        adapter.get_dividend_data(["s"])
+        self.assertEqual(attempts, {"bond": 2, "div": 2})
+

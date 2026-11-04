@@ -43,6 +43,7 @@ class InvestorService(
     _operations_cache: tuple[float, list[Operation]] | None = field(default=None, repr=False)
     _positions_status: str = field(default="fresh", repr=False)
     _operations_status: str = field(default="fresh", repr=False)
+    _broker_meta_seeded: bool = field(default=False, repr=False)
 
     def __post_init__(self) -> None:
         """Hydrate persisted singletons from storage, if attached."""
@@ -67,6 +68,12 @@ class InvestorService(
         to_date: str | None = None,
     ) -> dict[str, Any]:
         started = utc_now_iso()
+        if mode == "full":
+            # A full sync also re-reads static instrument metadata (sector/issuer/risk)
+            # instead of reusing what was seeded from the persisted positions.
+            reset = getattr(self.broker, "reset_instrument_cache", None)
+            if reset is not None:
+                reset()
         # Sync = force-refresh the cached data: accounts, portfolio AND operations.
         accounts = self._cached_accounts(force=True)
         positions = self._all_positions(force=True)

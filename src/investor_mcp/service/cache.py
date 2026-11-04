@@ -21,6 +21,7 @@ class CacheMixin:
             if cached is not None:
                 self._positions_status = "cached"
                 return cached
+        self._seed_broker_metadata(now)
         try:
             positions = self.broker.get_positions(None)
         except Exception:
@@ -38,6 +39,24 @@ class CacheMixin:
                  "positions": [p.to_dict() for p in positions]},
             )
         return positions
+
+    def _seed_broker_metadata(self, now: float) -> None:
+        """Once per process, pre-fill the broker's instrument-metadata cache from the
+        last persisted positions (even expired ones).
+
+        Sector/issuer/risk are static, but after a restart the adapter would otherwise
+        re-fetch them for every instrument — hundreds of API calls through the relay
+        and a ~20 s first response, which clients may time out on.
+        """
+        if self._broker_meta_seeded:
+            return
+        self._broker_meta_seeded = True
+        seed = getattr(self.broker, "seed_instrument_cache", None)
+        if seed is None:
+            return
+        cached = self._read_positions_cache(now, ignore_ttl=True)
+        if cached:
+            seed(position.instrument for position in cached)
 
     def _read_positions_cache(self, now: float, ignore_ttl: bool = False) -> list[Position] | None:
         if self._positions_cache is not None:

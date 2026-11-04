@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 
+from investor_mcp.models import Account, Instrument, Money, Position
 from investor_mcp.service import InvestorService
 
 
@@ -52,12 +53,14 @@ class InvestorServiceTest(unittest.TestCase):
         data = result["data"]
         self.assertGreater(len(data["research_targets"]), 0)
         self.assertEqual(data["events"], [])  # server doesn't fetch news itself
-        # bond issuer over the limit -> high priority, credit-focused queries (data-driven)
-        minfin = [t for t in data["research_targets"] if t["entity"] == "MinFin"]
-        self.assertTrue(minfin)
-        self.assertEqual(minfin[0]["asset_class"], "bond")
-        self.assertEqual(minfin[0]["priority"], "high")
-        self.assertTrue(any("кредитный рейтинг" in q for q in minfin[0]["search_queries"]))
+        # Targets are data-driven: top exposures become issuer targets with tailored queries...
+        entities = {t["entity"] for t in data["research_targets"]}
+        self.assertIn("Sber", entities)
+        # ...but federal bonds (ОФЗ / MinFin, sector government) are never framed as an
+        # issuer credit/default target, however large the exposure.
+        self.assertNotIn("MinFin", entities)
+        self.assertFalse(any("дефолт" in q for t in data["research_targets"] for q in t["search_queries"]
+                             if t.get("asset_class") == "bond"))
 
     def test_goal_progress_computes_capital_income_projection(self) -> None:
         from investor_mcp.storage import Storage
@@ -264,3 +267,80 @@ class InvestorServiceTest(unittest.TestCase):
 if __name__ == "__main__":
     unittest.main()
 
+
+class _StaticBroker:
+    """Minimal broker returning a fixed position list."""
+
+    def __init__(self, positions):
+        self._positions = list(positions)
+
+    def list_accounts(self):
+        return [Account(account_id="a1", name="Брокерский")]
+
+    def get_positions(self, account_ids=None):
+        return list(self._positions)
+
+    def get_operations(self, account_ids=None, from_date=None, to_date=None):
+        return []
+
+
+_OFZ = Instrument("u-ofz", "SU26248RMFS3", "ОФЗ 26248", "bond", issuer="ОФЗ", sector="government", risk_level="low")
+_MONEY_MARKET = Instrument("u-tmon", "TMON@", "Денежный рынок", "fund", issuer="Денежный рынок", sector="other", risk_level="low")
+_SBER = Instrument("u-sber", "SBER", "Сбербанк", "stock", issuer="Сбербанк", sector="financial")
+_FINEX = Instrument("u-fxru", "FXRU", "FinEx Еврооблигации", "fund", issuer="FinEx", sector="other", risk_level="low")
+_AGRO = Instrument("u-agro", "AGRO", "РусАгро GDR", "stock", issuer="РусАгро", sector="consumer")
+
+
+class DataQualityTest(unittest.TestCase):
+    def test_get_portfolio_explains_blocked_and_unpriced_positions(self) -> None:
+        service = InvestorService(broker=_StaticBroker([
+            Position("a1", _OFZ, 100, Money(900), Money(1000)),
+            Position("a1", _FINEX, 10, Money(50), Money(40), blocked=True),
+            Position("a1", _AGRO, 111, Money(900), Money(0)),  # held, but no price at the broker
+        ]))
+
+        result = service.get_portfolio()
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["data"]["total_value"]["amount"], 100 * 1000 + 10 * 40)
+        self.assertEqual(len(result["warnings"]), 2)
+        self.assertIn("FXRU", result["warnings"][0])
+        self.assertIn("заблокирован", result["warnings"][0])
+        self.assertIn("AGRO×111", result["warnings"][1])
+        self.assertIn("не сбой загрузки", result["warnings"][1])
+        self.assertIn("warnings", result["summary"])
+        flags = {p["instrument"]["ticker"]: p["blocked"] for p in result["data"]["positions"]}
+        self.assertEqual(flags, {"SU26248RMFS3": False, "FXRU": True, "AGRO": False})
+
+    def test_get_portfolio_has_no_warnings_for_a_clean_book(self) -> None:
+        service = InvestorService(broker=_StaticBroker([Position("a1", _SBER, 10, Money(250), Money(312))]))
+        result = service.get_portfolio()
+        self.assertEqual(result["warnings"], [])
+        self.assertEqual(result["summary"], "Портфель получен.")
+
+    def test_sovereign_and_money_market_are_not_issuer_credit_risks(self) -> None:
+        service = InvestorService(broker=_StaticBroker([
+            Position("a1", _OFZ, 600, Money(1000), Money(1000)),          # 60%
+            Position("a1", _MONEY_MARKET, 300, Money(1000), Money(1000)),  # 30%
+            Position("a1", _SBER, 100, Money(1000), Money(1000)),          # 10%
+        ]))
+
+        risks = service.scan_risks(severity_min="low")["data"]["risk_signals"]
+        self.assertEqual([r for r in risks if r["type"] == "issuer"], [])
+
+        digest = service.get_news_digest()["data"]
+        self.assertEqual([t["entity"] for t in digest["research_targets"] if t["kind"] == "issuer"], ["Сбербанк"])
+        lenses = {lens["lens"] for lens in digest["context_lenses"]}
+        self.assertIn("Ставка и ДКП", lenses)
+        self.assertNotIn("Кредитный риск / ВДО", lenses)
+
+    def test_corporate_bond_issuer_over_limit_still_flagged(self) -> None:
+        samolet = Instrument("u-smlt", "RU000A10BW96", "Самолет П18", "bond", issuer="ГК Самолет", sector="real_estate", risk_level="high")
+        service = InvestorService(broker=_StaticBroker([
+            Position("a1", samolet, 400, Money(1000), Money(1000)),  # 40% > 15% limit
+            Position("a1", _OFZ, 600, Money(1000), Money(1000)),
+        ]))
+        risks = service.scan_risks(severity_min="low")["data"]["risk_signals"]
+        self.assertEqual([r["id"] for r in risks if r["type"] == "issuer"], ["risk_issuer_ГК Самолет"])
+        lenses = {lens["lens"] for lens in service.get_news_digest()["data"]["context_lenses"]}
+        self.assertIn("Кредитный риск / ВДО", lenses)
