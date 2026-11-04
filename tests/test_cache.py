@@ -134,3 +134,50 @@ class CacheTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SeedingBroker(CountingBroker):
+    """Broker that accepts metadata seeding (like the Tinkoff adapter)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.seeded: list[str] = []
+        self.resets = 0
+
+    def seed_instrument_cache(self, instruments):
+        self.seeded = [i.instrument_id for i in instruments]
+        return len(self.seeded)
+
+    def reset_instrument_cache(self):
+        self.resets += 1
+
+
+class MetadataSeedingTest(unittest.TestCase):
+    def test_restart_seeds_broker_metadata_from_persisted_positions(self) -> None:
+        storage = Storage(":memory:")
+        first = InvestorService(broker=CountingBroker(), storage=storage)
+        expected = sorted({p.instrument.instrument_id for p in first.broker.get_positions()})
+        first.get_portfolio()  # persists positions_cache
+
+        broker = SeedingBroker()
+        restarted = InvestorService(broker=broker, storage=storage, cache_ttl_seconds=0)
+        restarted.get_portfolio()
+        restarted.get_portfolio()
+
+        self.assertEqual(sorted(broker.seeded), expected)
+        self.assertEqual(broker.positions_calls, 2)  # TTL 0 -> refetch, but seeding happens once
+
+    def test_full_sync_resets_metadata_cache(self) -> None:
+        broker = SeedingBroker()
+        service = InvestorService(broker=broker, storage=Storage(":memory:"))
+        service.sync_data(mode="incremental")
+        self.assertEqual(broker.resets, 0)
+        service.sync_data(mode="full")
+        self.assertEqual(broker.resets, 1)
+
+    def test_broker_without_seeding_support_is_fine(self) -> None:
+        storage = Storage(":memory:")
+        InvestorService(broker=CountingBroker(), storage=storage).get_portfolio()
+        broker = CountingBroker()
+        InvestorService(broker=broker, storage=storage, cache_ttl_seconds=0).get_portfolio()
+        self.assertEqual(broker.positions_calls, 1)

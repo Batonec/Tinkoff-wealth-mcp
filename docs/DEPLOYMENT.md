@@ -195,7 +195,8 @@ curl -s -o /dev/null -w "%{http_code}\n" --proxy http://127.0.0.1:8890 https://y
 journalctl -u investor-mcp --since -1h | grep -E "UNAVAILABLE|VERIFY_FAILED"            # should be empty
 ```
 
-Then call `investor_sync_data(force=true)` from the chat.
+Then call `investor_sync_data(force=true)` from the chat. `mode="full"` additionally
+re-reads the static instrument metadata (sector/issuer) instead of reusing the seeded cache.
 
 Symptoms and their meaning:
 
@@ -204,6 +205,8 @@ Symptoms and their meaning:
 | `Handshake read failed (Endpoint closing)` | traffic is not going through the relay: check the drop-in and the tunnel |
 | `CERTIFICATE_VERIFY_FAILED: self signed certificate in certificate chain` | the tunnel works, but gRPC is not using `grpc-roots.pem` |
 | `failed to connect to all addresses` + tunnel in `activating` | SSH to the relay does not come up: `journalctl -u tinkoff-tunnel` |
+| no error, but some positions have `current_value` 0 or `"blocked": true` | not a fetch problem: the broker reports those papers as blocked (foreign assets frozen in the depository) or without a market price; `investor_get_portfolio` lists them in `warnings` |
+| first call after a restart takes ~20 s | the adapter re-reads sector/issuer for every instrument; normally avoided by seeding from the persisted positions cache — happens only when the SQLite cache is empty |
 
 The relay is a single point of failure. If it is down, the server keeps serving the
 last cache, marked `stale`.

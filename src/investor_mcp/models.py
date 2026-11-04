@@ -57,6 +57,11 @@ class Instrument:
     sector: str = "unknown"
     risk_level: str = "medium"
 
+    @property
+    def is_sovereign(self) -> bool:
+        """Federal/government bonds (ОФЗ): rate risk, not issuer credit risk."""
+        return self.asset_class == "bond" and self.sector == "government"
+
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
@@ -81,6 +86,14 @@ class Position:
     quantity: float
     average_price: Money
     current_price: Money
+    # Broker-side state: the paper is held but cannot be traded (e.g. foreign
+    # assets frozen in the depository). Valued at the last known price.
+    blocked: bool = False
+
+    @property
+    def has_market_price(self) -> bool:
+        """False when the broker reports no price for a held quantity (valued at 0)."""
+        return bool(self.current_price.amount) or not self.quantity
 
     @property
     def current_value(self) -> Money:
@@ -105,6 +118,7 @@ class Position:
             "current_value": self.current_value.to_dict(),
             "pnl": self.pnl.to_dict(),
             "portfolio_share_percent": share,
+            "blocked": self.blocked,
         }
 
     @classmethod
@@ -115,6 +129,7 @@ class Position:
             quantity=float(data["quantity"]),
             average_price=Money.from_dict(data["average_price"]),
             current_price=Money.from_dict(data["current_price"]),
+            blocked=bool(data.get("blocked", False)),
         )
 
 

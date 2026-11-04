@@ -224,6 +224,13 @@ Resources - это читаемые сущности, которые AI-клие
 }
 ```
 
+Элемент `positions`: `account_id`, `instrument`, `quantity`, `average_price`, `current_price`,
+`current_value`, `pnl`, `portfolio_share_percent`, `blocked`. `blocked: true` — брокер пометил
+бумагу как заблокированную (торги недоступны, например иностранные активы в депозитарии);
+она оценена по последней известной цене. Позиция без рыночной цены у брокера оценивается в 0.
+`investor_get_portfolio` перечисляет и те, и другие в `warnings` — это состояние брокера,
+а не сбой загрузки данных.
+
 ### 6.3. Resource: `investor://profile/current`
 
 Пример структуры:

@@ -38,11 +38,14 @@ class ResearchMixin:
         for position in positions:
             value = position.current_value.amount
             instrument = position.instrument
-            issuer_value[instrument.issuer] += value
-            issuer_classes[instrument.issuer][instrument.asset_class] += value
             sector_value[instrument.sector] += value
             if instrument.asset_class == "bond":
                 bond_value += value
+            # ОФЗ carry rate risk (covered by the key-rate lens), not issuer credit risk.
+            if instrument.is_sovereign:
+                continue
+            issuer_value[instrument.issuer] += value
+            issuer_classes[instrument.issuer][instrument.asset_class] += value
 
         issuer_limit = float(self.profile.limits.get("max_single_issuer_percent", 15))
         sector_limit = float(self.profile.limits.get("max_single_sector_percent", 30))
@@ -167,10 +170,12 @@ class ResearchMixin:
             instrument = position.instrument
             by_class[instrument.asset_class] += value
             by_sector[instrument.sector] += value
-            issuer_value[instrument.issuer] += value
-            issuer_classes[instrument.issuer][instrument.asset_class] += value
             if instrument.currency != self.profile.base_currency:
                 foreign += value
+            if instrument.is_sovereign:
+                continue  # ОФЗ: rate lens, not the credit lens
+            issuer_value[instrument.issuer] += value
+            issuer_classes[instrument.issuer][instrument.asset_class] += value
 
         def pct(value: float) -> float:
             return round(value / total * 100, 1)
@@ -189,7 +194,7 @@ class ResearchMixin:
         ]
 
         lenses: list[dict[str, Any]] = []
-        if bond_share > 30:
+        if bond_share >= 20:
             lenses.append({
                 "lens": "Ставка и ДКП",
                 "priority": "high" if bond_share > 50 else "medium",

@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from ..models import Account, Instrument, Money, Operation, Position
 
@@ -22,6 +23,9 @@ _ASSET_CLASS = {
 _RISK_BY_CLASS = {"stock": "medium", "bond": "low", "fund": "low", "currency": "low", "cash": "low"}
 # Adapter converts all monetary values to this base currency.
 _BASE_CURRENCY = "RUB"
+# All federal loan bonds are one issuer (Минфин); Tinkoff brands them inconsistently
+# ("ОФЗ", "Russia", "Russia2028"), which would split the issuer concentration.
+_OFZ_ISSUER = "ОФЗ"
 
 
 def _money(value: Any) -> float:
@@ -55,6 +59,23 @@ def _date(value: Any) -> str | None:
         return value.date().isoformat() if hasattr(value, "date") else str(value)[:10]
     except Exception:
         return None
+
+
+def _is_ofz(ticker: str, name: str, asset_class: str) -> bool:
+    """Federal loan bonds (ОФЗ): tickers look like SU26248RMFS3, names start with ОФЗ."""
+    if asset_class != "bond":
+        return False
+    ticker = (ticker or "").upper()
+    return (ticker.startswith("SU") and "RMFS" in ticker) or (name or "").upper().startswith("ОФЗ")
+
+
+def normalize_instrument(instrument: Instrument) -> Instrument:
+    """Re-apply mapping rules to an Instrument restored from an older cache."""
+    if _is_ofz(instrument.ticker, instrument.name, instrument.asset_class) and (
+        instrument.issuer != _OFZ_ISSUER or instrument.sector != "government"
+    ):
+        return replace(instrument, issuer=_OFZ_ISSUER, sector="government")
+    return instrument
 
 
 def _currency_of(value: Any, fallback: str) -> str:
@@ -108,6 +129,9 @@ def map_instrument(pos: Any, instr: Any | None, issuer: str | None = None) -> In
     # Issuer = brand/company name (shared across an issuer's instruments, e.g. all
     # ГК Самолет bond series) so concentration groups correctly. Fall back to the
     # instrument name when the brand is unavailable.
+    if _is_ofz(ticker, name, asset_class):
+        issuer = _OFZ_ISSUER
+        sector = "government"
     return Instrument(
         instrument_id=instrument_id,
         ticker=ticker,
@@ -142,12 +166,14 @@ def map_position(
     nkd = _money(getattr(pos, "current_nkd", None)) if getattr(pos, "instrument_type", "") == "bond" else 0.0
     current_per_unit = (_money(current) + nkd) * rate
     average_per_unit = _money(average) * rate
+    blocked = bool(getattr(pos, "blocked", False)) or _money(getattr(pos, "blocked_lots", None)) > 0
     return Position(
         account_id=account_id,
         instrument=instrument,
         quantity=quantity,
         average_price=Money(average_per_unit, _BASE_CURRENCY),
         current_price=Money(current_per_unit, _BASE_CURRENCY),
+        blocked=blocked,
     )
 
 
@@ -220,31 +246,61 @@ class TinkoffInvestAdapter:
         return client.operations.get_portfolio(account_id=account_id)
 
     def _fx_rates(self, client: Any) -> dict[str, float]:
-        """Build {ISO currency -> RUB per 1 unit} from the currencies catalog + last prices."""
+        """Build {ISO currency -> RUB per 1 unit} from the currencies catalog + last prices.
+
+        Raises when the catalog/prices call fails: silently valuing foreign positions
+        at rate 1.0 would persist a wrong portfolio for a whole cache TTL, whereas a
+        raised error makes the service fall back to the previous (correct) cache.
+        A single currency without a last price still falls back to 1.0.
+        """
         rates = {_BASE_CURRENCY: 1.0}
-        try:
-            currencies = client.instruments.currencies().instruments
-            iso_by_uid: dict[str, tuple[str, float]] = {}
-            uids = []
-            for currency in currencies:
-                iso = (getattr(currency, "iso_currency_name", "") or "").upper()
-                nominal = _money(getattr(currency, "nominal", None)) or 1.0
-                iso_by_uid[currency.uid] = (iso, nominal)
-                uids.append(currency.uid)
+        currencies = client.instruments.currencies().instruments
+        iso_by_uid: dict[str, tuple[str, float]] = {}
+        uids = []
+        for currency in currencies:
+            iso = (getattr(currency, "iso_currency_name", "") or "").upper()
+            nominal = _money(getattr(currency, "nominal", None)) or 1.0
+            iso_by_uid[currency.uid] = (iso, nominal)
+            uids.append(currency.uid)
+        if uids:
             for last in client.market_data.get_last_prices(instrument_id=uids).last_prices:
                 iso, nominal = iso_by_uid.get(last.instrument_uid, ("", 1.0))
                 price = _money(getattr(last, "price", None))
                 if iso and price:
                     rates[iso] = price / nominal
-        except Exception:
-            pass
         return rates
+
+    def seed_instrument_cache(self, instruments: Iterable[Instrument]) -> int:
+        """Pre-fill instrument metadata (sector/issuer/risk) from a persisted source.
+
+        Metadata is static, but fetching it costs one typed lookup plus one asset
+        lookup per instrument (hundreds of calls through the relay after a restart).
+        Instruments with unknown sector are skipped so an earlier failed lookup is
+        retried rather than pinned. Returns the number of entries added.
+        """
+        added = 0
+        for instrument in instruments:
+            uid = instrument.instrument_id
+            if not uid or uid in self._instrument_cache:
+                continue
+            if instrument.sector == "unknown" and instrument.asset_class not in {"cash", "currency"}:
+                continue
+            self._instrument_cache[uid] = normalize_instrument(instrument)
+            added += 1
+        return added
+
+    def reset_instrument_cache(self) -> None:
+        """Forget cached metadata so the next fetch re-reads it from the API."""
+        self._instrument_cache.clear()
+        self._brand_cache.clear()
 
     def _instrument_meta(self, client: Any, pos: Any) -> Instrument:
         uid = getattr(pos, "instrument_uid", "") or getattr(pos, "figi", "")
         if uid in self._instrument_cache:
             return self._instrument_cache[uid]
         instr = None
+        issuer = None
+        complete = True
         try:
             uid_type = _uid_id_type()
             instrument_type = getattr(pos, "instrument_type", "")
@@ -259,11 +315,16 @@ class TinkoffInvestAdapter:
                 instr = instruments.etf_by(id_type=uid_type, id=uid).instrument
             else:
                 instr = instruments.get_instrument_by(id_type=uid_type, id=uid).instrument
+            if instr is not None:
+                issuer = self._brand_name(client, getattr(instr, "asset_uid", ""))
         except Exception:
-            instr = None
-        issuer = self._brand_name(client, getattr(instr, "asset_uid", "")) if instr is not None else None
+            # Transient failure (relay hiccup, rate limit): degrade this call only.
+            # Caching the degraded result would pin "unknown" sector / no issuer for
+            # the life of the process and surface as partially loaded data.
+            complete = False
         meta = map_instrument(pos, instr, issuer=issuer)
-        self._instrument_cache[uid] = meta
+        if complete:
+            self._instrument_cache[uid] = meta
         return meta
 
     def _brand_name(self, client: Any, asset_uid: str) -> str | None:
@@ -277,12 +338,9 @@ class TinkoffInvestAdapter:
             return None
         if asset_uid in self._brand_cache:
             return self._brand_cache[asset_uid]
-        name: str | None = None
-        try:
-            asset = client.instruments.get_asset_by(id=asset_uid).asset
-            name = (getattr(asset.brand, "name", "") or "").strip() or None
-        except Exception:
-            name = None
+        # Errors propagate to _instrument_meta, which then skips caching.
+        asset = client.instruments.get_asset_by(id=asset_uid).asset
+        name = (getattr(asset.brand, "name", "") or "").strip() or None
         self._brand_cache[asset_uid] = name
         return name
 
@@ -351,6 +409,11 @@ class TinkoffInvestAdapter:
         Coupons come from get_bond_coupons (pay_one_bond per coupon); maturity/offer
         from the bond card. Amounts are per ONE bond; the service scales by quantity.
         """
+        empty = {
+            "maturity_date": None, "offer_date": None, "nominal": 0.0,
+            "currency": _BASE_CURRENCY, "coupon_quantity_per_year": 0,
+            "amortization": False, "perpetual": False, "floating": False, "coupons": [],
+        }
         missing = [uid for uid in instrument_uids if uid not in self._bond_cache]
         if missing:
             uid_type = _uid_id_type()
@@ -360,17 +423,11 @@ class TinkoffInvestAdapter:
                 for uid in missing:
                     try:
                         bond = client.instruments.bond_by(id_type=uid_type, id=uid).instrument
-                        coupons: list[dict[str, Any]] = []
-                        try:
-                            response = client.instruments.get_bond_coupons(
-                                instrument_id=uid, from_=now, to=horizon
-                            )
-                            for event in response.events:
-                                coupons.append(
-                                    {"date": _date(event.coupon_date), "amount_per_bond": _money(event.pay_one_bond)}
-                                )
-                        except Exception:
-                            coupons = []
+                        response = client.instruments.get_bond_coupons(instrument_id=uid, from_=now, to=horizon)
+                        coupons = [
+                            {"date": _date(event.coupon_date), "amount_per_bond": _money(event.pay_one_bond)}
+                            for event in response.events
+                        ]
                         nominal = getattr(bond, "nominal", None)
                         self._bond_cache[uid] = {
                             "maturity_date": _date(getattr(bond, "maturity_date", None)),
@@ -384,12 +441,10 @@ class TinkoffInvestAdapter:
                             "coupons": [c for c in coupons if c["date"]],
                         }
                     except Exception:
-                        self._bond_cache[uid] = {
-                            "maturity_date": None, "offer_date": None, "nominal": 0.0,
-                            "currency": _BASE_CURRENCY, "coupon_quantity_per_year": 0,
-                            "amortization": False, "perpetual": False, "floating": False, "coupons": [],
-                        }
-        return {uid: self._bond_cache[uid] for uid in instrument_uids}
+                        # Transient failure: answer "no data" for this call only, so the
+                        # next calendar call retries instead of pinning an empty schedule.
+                        continue
+        return {uid: self._bond_cache.get(uid, empty) for uid in instrument_uids}
 
     def get_dividend_data(self, instrument_uids: list[str]) -> dict[str, dict[str, Any]]:
         """Trailing-12m dividends per share, converted to base currency (cached).
@@ -413,7 +468,9 @@ class TinkoffInvestAdapter:
                             currency = (getattr(net, "currency", "") or _BASE_CURRENCY).upper()
                             annual += _money(net) * fx.get(currency, 1.0)
                     except Exception:
-                        annual = 0.0
+                        # Transient failure: don't cache a 0 that would understate income
+                        # until the process restarts; the next call retries.
+                        continue
                     self._dividend_cache[uid] = {"annual_dividend_per_share": round(annual, 4)}
-        return {uid: self._dividend_cache[uid] for uid in instrument_uids}
+        return {uid: self._dividend_cache.get(uid, {"annual_dividend_per_share": 0.0}) for uid in instrument_uids}
 

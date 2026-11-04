@@ -6,7 +6,7 @@ from collections import defaultdict
 from typing import Any
 
 from ..models import Position
-from ..responses import ok_response
+from ..responses import _NON_ISSUER, ok_response
 
 
 class RiskMixin:
@@ -53,7 +53,11 @@ class RiskMixin:
 
         issuer_shares: dict[str, float] = defaultdict(float)
         for position in positions:
-            issuer_shares[position.instrument.issuer] += position.current_value.amount
+            instrument = position.instrument
+            # Cash-like holdings and federal bonds (ОФЗ) are not issuer credit risk.
+            if instrument.issuer in _NON_ISSUER or instrument.is_sovereign:
+                continue
+            issuer_shares[instrument.issuer] += position.current_value.amount
         for issuer, value in issuer_shares.items():
             share = value / total * 100 if total else 0
             if share > issuer_limit:

@@ -29,7 +29,40 @@ class PortfolioMixin:
             data["positions"] = [position.to_dict(total) for position in positions]
         if include_allocation:
             data["allocation"] = self._allocation_payload(positions, total)
-        return ok_response("Портфель получен.", data, data_status=self._positions_status)
+        summary, warnings = self._position_quality(positions)
+        return ok_response(summary, data, data_status=self._positions_status, warnings=warnings)
+
+    def _position_quality(self, positions: list[Position]) -> tuple[str, list[str]]:
+        """Summary + warnings that explain blocked / unpriced positions.
+
+        A broker-blocked paper or a position valued at 0 is the broker's state, not a
+        failed fetch; saying so explicitly keeps clients from reporting "data did not
+        load" (and from guessing at infrastructure causes).
+        """
+        blocked = [p for p in positions if p.blocked]
+        unpriced = [p for p in positions if not p.has_market_price]
+        warnings: list[str] = []
+        bits: list[str] = []
+        if blocked:
+            value = sum(p.current_value.amount for p in blocked)
+            tickers = ", ".join(sorted({p.instrument.ticker for p in blocked}))
+            amount = f"{value:,.0f}".replace(",", " ")
+            warnings.append(
+                f"{len(blocked)} позиций брокер помечает как заблокированные (торги недоступны); "
+                f"они оценены по последней известной цене на {amount} {self.profile.base_currency}: {tickers}."
+            )
+            bits.append(f"{len(blocked)} позиций заблокированы брокером")
+        if unpriced:
+            items = ", ".join(f"{p.instrument.ticker}×{p.quantity:g}" for p in unpriced)
+            warnings.append(
+                f"{len(unpriced)} позиций без рыночной цены у брокера — оценены в 0 и не входят в total_value: "
+                f"{items}. Это не сбой загрузки: данные брокера получены полностью."
+            )
+            bits.append(f"{len(unpriced)} без рыночной цены")
+        summary = "Портфель получен."
+        if bits:
+            summary = f"Портфель получен ({'; '.join(bits)} — см. warnings)."
+        return summary, warnings
 
     def analyze_portfolio(
         self,
@@ -93,7 +126,10 @@ class PortfolioMixin:
             },
             "currency_effect": [],
             "related_events": self._mock_events() if include_news else [],
-            "interpretation": "Основной вклад рассчитан по разнице средней и текущей цены mock-позиций.",
+            "interpretation": (
+                "Вклад каждой позиции = (текущая цена − средняя цена покупки) × количество, "
+                "т.е. накопленный результат позиции, а не изменение строго за период."
+            ),
         }
         return ok_response("Изменение портфеля объяснено.", data, data_status="cached")
 
